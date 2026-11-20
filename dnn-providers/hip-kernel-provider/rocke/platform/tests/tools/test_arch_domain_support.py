@@ -514,6 +514,74 @@ class SupportComparisonTest(unittest.TestCase):
                     self.assertIn("baseline=", "; ".join(comparison.failures))
                     self.assertIn("current=", "; ".join(comparison.failures))
 
+    def _doc_with_contract(self, key: str, decl: str) -> dict:
+        doc = json.loads(self._doc())
+        doc["keys"] = {key: doc["keys"].pop("a.b")}
+        doc["probe_contracts"] = {key: G._probe_contract(G._probe_spec(key, decl))}
+        return doc
+
+    # The declarations opt prints back before and after the llvm24 change.
+    _ASYNCMARK_DECLS = (
+        (
+            "asyncmark",
+            "declare void @llvm.amdgcn.asyncmark()",
+            "declare void @llvm.amdgcn.asyncmark(i32 immarg range(i32 0, 2048))",
+        ),
+        (
+            "wait.asyncmark",
+            "declare void @llvm.amdgcn.wait.asyncmark(i16 immarg)",
+            "declare void @llvm.amdgcn.wait.asyncmark(i16 immarg, "
+            "i32 immarg range(i32 0, 2048))",
+        ),
+    )
+
+    def test_listed_autoupgrade_contracts_pass_in_either_direction(self):
+        for key, old, new in self._ASYNCMARK_DECLS:
+            before = self._doc_with_contract(key, old)
+            after = self._doc_with_contract(key, new)
+            for a, b in ((before, after), (after, before)):
+                with self.subTest(key=key, baseline=a["probe_contracts"][key]):
+                    comparison = G._compare_support(json.dumps(a), json.dumps(b))
+                    self.assertEqual(comparison.failures, [])
+                    self.assertEqual(
+                        [
+                            c.split(":")[0]
+                            for c in comparison.changes["contract_upgraded"]
+                        ],
+                        [f"{key}/{self.ARCH}"],
+                    )
+
+    def test_other_changes_to_a_listed_key_still_fail(self):
+        for key, old, new in (
+            (
+                "asyncmark",
+                "declare void @llvm.amdgcn.asyncmark()",
+                "declare void @llvm.amdgcn.asyncmark(i64 immarg)",
+            ),
+            (
+                "wait.asyncmark",
+                "declare void @llvm.amdgcn.wait.asyncmark(i16 immarg)",
+                "declare void @llvm.amdgcn.wait.asyncmark(i32 immarg)",
+            ),
+        ):
+            with self.subTest(key=key):
+                comparison = G._compare_support(
+                    json.dumps(self._doc_with_contract(key, old)),
+                    json.dumps(self._doc_with_contract(key, new)),
+                )
+                self.assertIn(
+                    f"{key}/{self.ARCH}: positive probe contract changed",
+                    "; ".join(comparison.failures),
+                )
+                self.assertEqual(comparison.changes["contract_upgraded"], [])
+
+    def test_unchanged_listed_contracts_report_no_upgrade(self):
+        key, old, _new = self._ASYNCMARK_DECLS[0]
+        doc = json.dumps(self._doc_with_contract(key, old))
+        comparison = G._compare_support(doc, doc)
+        self.assertEqual(comparison.failures, [])
+        self.assertEqual(comparison.changes["contract_upgraded"], [])
+
     def test_contract_describes_the_operands_actually_rendered(self):
         spec = G.ProbeSpec(
             "declare void @llvm.test(i32, i1 immarg, i32 immarg, ptr, ptr addrspace(3), ptr addrspace(8), metadata)",

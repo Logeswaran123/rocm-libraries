@@ -77,9 +77,11 @@ A host probes its own LLVM flavor. Every column records compiler identity as
 provenance, and the generator refuses to mix tools or label results with the
 wrong flavor. `--check` compares retained support across builds within that
 flavor: retained positives must ask the same effective operand/signature
-question, and gains and improved classifications are reported. Support loss,
-invalid provenance/records, and non-comparable probe contracts fail. Remaining
-no-data cells are not qualified; writing also requires a valid generated column.
+question, unless the change is a listed AutoUpgrade signature change
+(`_UPGRADED_PROBE_CONTRACTS`), and gains and improved classifications are
+reported. Support loss, invalid provenance/records, and non-comparable probe
+contracts fail. Remaining no-data cells are not qualified; writing also
+requires a valid generated column.
 
 Usage:
   python rocke/platform/tools/gen_arch_domain.py            # write the artifact
@@ -1095,6 +1097,41 @@ class _SupportComparison(NamedTuple):
     changes: dict[str, list[str]]
 
 
+def _immediates(*types: str) -> list[dict]:
+    return [{"source": "immediate", "type": ty, "value": "0"} for ty in types]
+
+
+# Signatures that grew within one flavor, where AutoUpgrade still maps the old
+# call onto the new intrinsic. The probe is built from the declaration opt
+# prints back, so a toolchain on either side of the change asks its own form.
+# Each pair is accepted in either direction, so a column blessed on one side
+# checks clean on the other. Add a pair only with evidence that the decl rocke
+# emits still compiles on the new toolchain.
+#
+# llvm24: asyncmark and wait.asyncmark gained a trailing i32 stage mask
+# (ROCm nightly 10.3.0a20261119). The old calls upgrade to stages=all, which
+# is also what the probe's 0 encodes.
+_UPGRADED_PROBE_CONTRACTS: dict[str, tuple[dict, dict]] = {
+    key: tuple(
+        {
+            "operands": _immediates(*types),
+            "return_type": "void",
+            "version": PROBE_CONTRACT_VERSION,
+        }
+        for types in (old, new)
+    )
+    for key, old, new in (
+        ("asyncmark", (), ("i32",)),
+        ("wait.asyncmark", ("i16",), ("i16", "i32")),
+    )
+}
+
+
+def _is_known_contract_upgrade(key: str, before: dict, after: dict) -> bool:
+    pair = _UPGRADED_PROBE_CONTRACTS.get(key)
+    return pair is not None and before != after and before in pair and after in pair
+
+
 # Rows are recorded states; columns are freshly measured states. Unknown
 # answers are not ordered support levels: resolving one to unavailable improves
 # measurement, while losing a definite negative does not lose working support.
@@ -1482,6 +1519,7 @@ def _compare_support(committed: str, fresh: str) -> _SupportComparison:
                 "unknown_changed",
                 "unavailable_changed",
                 "unvalidated",
+                "contract_upgraded",
             )
         },
     )
@@ -1547,7 +1585,16 @@ def _compare_support(committed: str, fresh: str) -> _SupportComparison:
             ):
                 result.changes["unvalidated"].append(f"{key}/{arch}: {after}")
             if before == after == STATUS_OK:
-                if a["probe_contracts"][key] != b["probe_contracts"][key]:
+                if _is_known_contract_upgrade(
+                    key, a["probe_contracts"][key], b["probe_contracts"][key]
+                ):
+                    result.changes["contract_upgraded"].append(
+                        f"{key}/{arch}: "
+                        + _describe_field_changes(
+                            a["probe_contracts"][key], b["probe_contracts"][key]
+                        )
+                    )
+                elif a["probe_contracts"][key] != b["probe_contracts"][key]:
                     result.failures.append(
                         f"{key}/{arch}: positive probe contract changed -- "
                         + _describe_field_changes(
@@ -2425,6 +2472,7 @@ def main() -> int:
             ("unavailable_changed", "UNAVAILABLE CHANGED"),
             ("unknown_changed", "NO-DATA CHANGED"),
             ("unvalidated", "NO-DATA (not qualified)"),
+            ("contract_upgraded", "PROBE CONTRACT UPGRADED"),
         ):
             changes = comparison.changes[kind]
             if changes:
